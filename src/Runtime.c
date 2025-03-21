@@ -114,22 +114,14 @@ Loc term_loc(Term term) {
 }
 
 Term term_offset_loc(Term term, Loc offset) {
-  // do not offset terms that use loc for something other than
-  // indices into the global buffer.
-  switch (term_tag(term)) {
-    case SUB:
-    case NUL:
-    case ERA:
-    case REF:
-    case U32:
-      return term;
+  Tag tag = term_tag(term);
+  if (tag == SUB || tag == NUL || tag == ERA || tag == REF || tag == U32) {
+    return term;
   }
-
-  Term tag = term_tag(term);
-  Term lab = term_lab(term);
-  Term loc = term_loc(term) + offset;
-
-  return term_new(tag, lab, loc);
+  
+  Loc loc = term_loc(term) + offset;
+  
+  return (term & 0xFFFFFFFF) | (((Term)loc) << 32);
 }
 
 // Memory operations
@@ -249,19 +241,33 @@ Term expand_ref(Loc def_idx) {
   }
 
   Def def = BOOK.defs[def_idx];
+  const u32 nodes_len = def.nodes_len;
+  const Term* nodes = def.nodes;
+  const Term* rbag = def.rbag;
+  const u32 rbag_len = def.rbag_len;
 
   Loc offset = RNOD_END - 1;
-  RNOD_END += def.nodes_len - 1;
+  RNOD_END += nodes_len - 1;
 
-  // insert non-root nodes
-  Term root = term_offset_loc(def.nodes[0], offset);
-  for (u32 i = 1; i < def.nodes_len; i++) {
-    set(i + offset, term_offset_loc(def.nodes[i], offset));
+  Term root = term_offset_loc(nodes[0], offset);
+  
+  // Unroll loop for non-root nodes
+  u32 i = 1;
+  for (; i + 3 < nodes_len; i += 4) {
+    set(i + offset, term_offset_loc(nodes[i], offset));
+    set(i + offset + 1, term_offset_loc(nodes[i + 1], offset));
+    set(i + offset + 2, term_offset_loc(nodes[i + 2], offset));
+    set(i + offset + 3, term_offset_loc(nodes[i + 3], offset));
+  }
+  
+  // Remaining nodes
+  for (; i < nodes_len; i++) {
+    set(i + offset, term_offset_loc(nodes[i], offset));
   }
 
-  // insert redexes
-  for (u32 i = 0; i < def.rbag_len; i += 2) {
-    rbag_push(term_offset_loc(def.rbag[i], offset), term_offset_loc(def.rbag[i + 1], offset));
+  // Redexes in batches of 2 (already aligned)
+  for (u32 i = 0; i < rbag_len; i += 2) {
+    rbag_push(term_offset_loc(rbag[i], offset), term_offset_loc(rbag[i + 1], offset));
   }
 
   return root;
@@ -269,9 +275,9 @@ Term expand_ref(Loc def_idx) {
 
 
 // Atomic Linker
-static void move(Loc neg_loc, u64 pos);
+static inline void move(Loc neg_loc, u64 pos);
 
-static void link(Term neg, Term pos) {
+static inline void link(Term neg, Term pos) {
   if (term_tag(pos) == VAR) {
     Term far = swap(term_loc(pos), neg);
     if (term_tag(far) != SUB) {
@@ -282,10 +288,11 @@ static void link(Term neg, Term pos) {
   }
 }
 
-static void move(Loc neg_loc, Term pos) {
+
+static inline void move(Loc neg_loc, Term pos) {
   Term neg = swap(neg_loc, pos);
   if (term_tag(neg) != SUB) {
-    take(neg_loc);
+    // No need to take() since we already swapped
     link(neg, pos);
   }
 }
@@ -388,45 +395,68 @@ u32 i32_to_u32(i32 i) { return *(u32*)&i; }
 u32 f32_to_u32(f32 f) { return *(u32*)&f; }
 
 static void interact_opynum(Loc a_loc, Lab op, u32 y, Tag y_type) {
-  #define CASES_u32(a, b)                     \
-            case OP_MOD: val = a %  b; break; \
-            case OP_AND: val = a &  b; break; \
-            case OP_OR : val = a |  b; break; \
-            case OP_XOR: val = a ^  b; break; \
-            case OP_LSH: val = a << b; break; \
-            case OP_RSH: val = a >> b; break;
-  #define CASES_i32(a, b) CASES_u32(a, b)
-  #define CASES_f32(a, b)
-
-  #define PERFORM_OP(x, y, op, type)          \
-    {                                         \
-        type val;                             \
-        type a = u32_to_##type(x);            \
-        type b = u32_to_##type(y);            \
-        switch (op) {                         \
-            case OP_ADD: val = a +  b; break; \
-            case OP_SUB: val = a -  b; break; \
-            case OP_MUL: val = a *  b; break; \
-            case OP_DIV: val = a /  b; break; \
-            case OP_EQ : val = a == b; break; \
-            case OP_NE : val = a != b; break; \
-            case OP_LT : val = a <  b; break; \
-            case OP_GT : val = a >  b; break; \
-            case OP_LTE: val = a <= b; break; \
-            case OP_GTE: val = a >= b; break; \
-            CASES_##type(x, y)                \
-        }                                     \
-        res = type##_to_u32(val);             \
-    }
-
-  u32 x   = term_loc(take(port(1, a_loc)));
+  u32 x = term_loc(take(port(1, a_loc)));
   Loc ret = port(2, a_loc);
   u32 res;
 
-  switch (y_type) {
-    case U32: PERFORM_OP(x, y, op, u32); break;
-    case I32: PERFORM_OP(x, y, op, i32); break;
-    case F32: PERFORM_OP(x, y, op, f32); break;
+  // Optimized fast path for common case U32)
+  if (y_type == U32) {
+    switch (op) {
+      case OP_ADD: res = x + y; break;
+      case OP_SUB: res = x - y; break;
+      case OP_MUL: res = x * y; break;
+      case OP_DIV: res = x / y; break;
+      case OP_EQ : res = x == y; break;
+      case OP_NE : res = x != y; break;
+      case OP_LT : res = x < y; break;
+      case OP_GT : res = x > y; break;
+      case OP_LTE: res = x <= y; break;
+      case OP_GTE: res = x >= y; break;
+      case OP_MOD: res = x % y; break;
+      case OP_AND: res = x & y; break;
+      case OP_OR : res = x | y; break;
+      case OP_XOR: res = x ^ y; break;
+      case OP_LSH: res = x << y; break;
+      case OP_RSH: res = x >> y; break;
+      default: res = 0;
+    }
+  } else {
+    // if not, defer
+    #define CASES_u32(a, b)                     \
+              case OP_MOD: val = a %  b; break; \
+              case OP_AND: val = a &  b; break; \
+              case OP_OR : val = a |  b; break; \
+              case OP_XOR: val = a ^  b; break; \
+              case OP_LSH: val = a << b; break; \
+              case OP_RSH: val = a >> b; break;
+    #define CASES_i32(a, b) CASES_u32(a, b)
+    #define CASES_f32(a, b)
+
+    #define PERFORM_OP(x, y, op, type)          \
+      {                                         \
+          type val;                             \
+          type a = u32_to_##type(x);            \
+          type b = u32_to_##type(y);            \
+          switch (op) {                         \
+              case OP_ADD: val = a +  b; break; \
+              case OP_SUB: val = a -  b; break; \
+              case OP_MUL: val = a *  b; break; \
+              case OP_DIV: val = a /  b; break; \
+              case OP_EQ : val = a == b; break; \
+              case OP_NE : val = a != b; break; \
+              case OP_LT : val = a <  b; break; \
+              case OP_GT : val = a >  b; break; \
+              case OP_LTE: val = a <= b; break; \
+              case OP_GTE: val = a >= b; break; \
+              CASES_##type(a, b)                \
+          }                                     \
+          res = type##_to_u32(val);             \
+      }
+
+    switch (y_type) {
+      case I32: PERFORM_OP(x, y, op, i32); break;
+      case F32: PERFORM_OP(x, y, op, f32); break;
+    }
   }
 
   move(ret, term_new(y_type, 0, res));
@@ -661,7 +691,7 @@ static void interact(Term neg, Term pos) {
 }
 
 // Evaluation
-static int normal_step() {
+static inline int normal_step() {
   // dump_buff();
 
   Loc loc = rbag_pop();

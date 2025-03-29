@@ -27,5 +27,10 @@ executable hvms
     hs-source-dirs:   src
     default-language: GHC2024
     c-sources:        src/Runtime.c
+    if os(linux) && arch(x86_64) -- FIXME: Make it detect specificaly AMD arch
+        extra-lib-dirs:  
+        cc-options: -O3 -march=znver3 
+    else 
+        cc-options:  -O3 -Wall
     extra-libraries:  c
     ghc-options:     -Wno-all

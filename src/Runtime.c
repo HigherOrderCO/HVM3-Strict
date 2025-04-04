@@ -146,6 +146,13 @@ const Term VOID = 0;
 typedef uint64_t u64;
 typedef _Atomic(u64) a64;
 
+// Using union for type punning (safer in C)
+typedef union {
+    u32 u;
+    i32 i;
+    f32 f;
+} TypeConverter;
+
 // Global heap
 static a64 *BUFF = NULL;
 static a64 RNOD_INI = 0;
@@ -482,12 +489,32 @@ static void interact_opynul(Loc a_loc) {
   move(ret, term_new(NUL, 0, 0));
 }
 
-// Utilities
-u32 u32_to_u32(u32 u) { return u; }
-i32 u32_to_i32(u32 u) { return *(i32 *)&u; }
-f32 u32_to_f32(u32 u) { return *(f32 *)&u; }
-u32 i32_to_u32(i32 i) { return *(u32 *)&i; }
-u32 f32_to_u32(f32 f) { return *(u32 *)&f; }
+// Safer Utilities
+u32 u32_to_u32(u32 u) { return u; }  
+
+i32 u32_to_i32(u32 u) { 
+    TypeConverter converter;
+    converter.u = u;
+    return converter.i;
+}
+
+f32 u32_to_f32(u32 u) {
+    TypeConverter converter;
+    converter.u = u;
+    return converter.f;
+}
+
+u32 i32_to_u32(i32 i) {
+    TypeConverter converter;
+    converter.i = i;
+    return converter.u;
+}
+
+u32 f32_to_u32(f32 f) {
+    TypeConverter converter;
+    converter.f = f;
+    return converter.u;
+}
 
 static void interact_opynum(Loc a_loc, Lab op, u32 y, Tag y_type) {
   u32 x = term_loc(take(port(1, a_loc)));
@@ -967,13 +994,15 @@ static inline int normal_step() {
   return 1;
 }
 
-// FFI exports
 void hvm_init() {
   if (BUFF == NULL) {
-    //    BUFF = malloc((1ULL << 24) * sizeof(a64));
     BUFF = aligned_alloc(64, (1ULL << 26) * sizeof(a64));
+    if (BUFF == NULL) {
+      fprintf(stderr, "Memory allocation failed\n");
+      exit(EXIT_FAILURE);
+    }
   }
-  memset(BUFF, 0, (1ULL << 24) * sizeof(a64));
+  memset(BUFF, 0, (1ULL << 26) * sizeof(a64)); // FIXED ALLOCATION
 
   atomic_store(&RNOD_INI, 0);
   atomic_store(&RNOD_END, 0);

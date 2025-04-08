@@ -7,6 +7,17 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(__SSE__) || defined(__SSE2__) || defined(_M_X64) || defined(_M_AMD64)
+#include <emmintrin.h> // SSE2
+#include <immintrin.h> // AVX and newer
+#define HVM_HAS_SIMD 1
+#elif defined(__ARM_NEON) || defined(__ARM_NEON__)
+#include <arm_neon.h>
+#define HVM_HAS_SIMD 1
+#else
+#define HVM_HAS_SIMD 0
+#endif
+
 #define DEBUG_LOG(fmt, ...) printf("[DEBUG] " fmt "\n", ##__VA_ARGS__)
 
 // WINDOWS WIP
@@ -238,6 +249,54 @@ u64 inc_itr() {
 } // if (atomic_load(&RNOD_END) % 2 == 0) { return atomic_load(&RNOD_END) / 2; }
   // }
 
+#if HVM_HAS_SIMD
+// Copy a block of Terms using SIMD
+void simd_copy_terms(Term *dst, const Term *src, size_t count) {
+#if defined(__AVX512F__)
+    
+    for (size_t i = 0; i < count / 8; i++) {
+        __m512i data = _mm512_loadu_si512((__m512i*)&src[i*8]);
+        _mm512_storeu_si512((__m512i*)&dst[i*8], data);
+    }
+    
+    for (size_t i = (count / 8) * 8; i < count; i++) {
+        dst[i] = src[i];
+    }
+#elif defined(__AVX2__)
+    
+    for (size_t i = 0; i < count / 4; i++) {
+        __m256i data = _mm256_loadu_si256((__m256i*)&src[i*4]);
+        _mm256_storeu_si256((__m256i*)&dst[i*4], data);
+    }
+    
+    for (size_t i = (count / 4) * 4; i < count; i++) {
+        dst[i] = src[i];
+    }
+#elif defined(__SSE2__)
+    for (size_t i = 0; i < count / 2; i++) {
+        __m128i data = _mm_loadu_si128((__m128i*)&src[i*2]);
+        _mm_storeu_si128((__m128i*)&dst[i*2], data);
+    }
+    
+    if (count % 2) {
+        dst[count-1] = src[count-1];
+    }
+#elif defined(__ARM_NEON) || defined(__ARM_NEON__)
+    for (size_t i = 0; i < count / 2; i++) {
+        uint64x2_t data = vld1q_u64((const uint64_t*)&src[i*2]);
+        vst1q_u64((uint64_t*)&dst[i*2], data);
+    }
+    
+    if (count % 2) {
+        dst[count-1] = src[count-1];
+    }
+#else
+    memcpy(dst, src, count * sizeof(Term));
+#endif
+}
+#endif
+
+
 Loc rbag_push(Term neg, Term pos) {
   // Atomically fetch and add to increment RBAG_END
   // This ensures thread-safe allocation of a new location pair
@@ -312,13 +371,16 @@ void def_new(char *name) {
       .rbag_len = rbag_end,
   };
 
+#if HVM_HAS_SIMD
+  // Use SIMD operations for copying
+  simd_copy_terms(def.nodes, (Term*)BUFF, def.nodes_len);
+  simd_copy_terms(def.rbag, (Term*)(BUFF + RBAG), def.rbag_len);
+#else
   memcpy(def.nodes, BUFF, sizeof(Term) * def.nodes_len);
   memcpy(def.rbag, BUFF + RBAG, sizeof(Term) * def.rbag_len);
+#endif
 
-  // printf("NEW DEF '%s':\n", def.name);
-  // dump_buff();
-  // printf("\n");
-
+  // Clear the buffers
   memset(BUFF, 0, sizeof(Term) * def.nodes_len);
   memset(BUFF + RBAG, 0, sizeof(Term) * def.rbag_len);
 
@@ -351,6 +413,28 @@ Term expand_ref(Loc def_idx) {
 
   Term root = term_offset_loc(nodes[0], offset);
 
+#if HVM_HAS_SIMD && defined(__SSE2__)
+  if (nodes_len > 16) {
+    u32 i = 1;
+    
+    // Process 8 terms at a time, compiler will unroll and use SIMD
+    for (; i + 7 < nodes_len; i += 8) {
+      for (int j = 0; j < 8; j++) {
+        set(i + offset + j, term_offset_loc(nodes[i + j], offset));
+      }
+    }
+    
+    for (; i < nodes_len; i++) {
+      set(i + offset, term_offset_loc(nodes[i], offset));
+    }
+  } else {
+    // For small node lists, use the og approach
+    u32 i = 1;
+    for (; i < nodes_len; i++) {
+      set(i + offset, term_offset_loc(nodes[i], offset));
+    }
+  }
+#else
   // Unroll loop, better branch prediction
   u32 i = 1;
   for (; i + 7 < nodes_len; i += 8) {
@@ -364,10 +448,10 @@ Term expand_ref(Loc def_idx) {
     set(i + offset + 7, term_offset_loc(nodes[i + 7], offset));
   }
 
-  // Remaining nodes
   for (; i < nodes_len; i++) {
     set(i + offset, term_offset_loc(nodes[i], offset));
   }
+#endif
 
   // Redexes in batches of 2 (already aligned)
   for (u32 i = 0; i < rbag_len; i += 2) {

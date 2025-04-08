@@ -253,51 +253,44 @@ u64 inc_itr() {
 // Copy a block of Terms using SIMD
 void simd_copy_terms(Term *dst, const Term *src, size_t count) {
 #if defined(__AVX512F__)
-    // AVX-512 version - 64 bytes at a time (8 Terms)
+    
     for (size_t i = 0; i < count / 8; i++) {
         __m512i data = _mm512_loadu_si512((__m512i*)&src[i*8]);
         _mm512_storeu_si512((__m512i*)&dst[i*8], data);
     }
     
-    // Handle remainder
     for (size_t i = (count / 8) * 8; i < count; i++) {
         dst[i] = src[i];
     }
 #elif defined(__AVX2__)
-    // AVX2 version - 32 bytes at a time (4 Terms)
+    
     for (size_t i = 0; i < count / 4; i++) {
         __m256i data = _mm256_loadu_si256((__m256i*)&src[i*4]);
         _mm256_storeu_si256((__m256i*)&dst[i*4], data);
     }
     
-    // Handle remainder
     for (size_t i = (count / 4) * 4; i < count; i++) {
         dst[i] = src[i];
     }
 #elif defined(__SSE2__)
-    // SSE2 version - 16 bytes at a time (2 Terms)
     for (size_t i = 0; i < count / 2; i++) {
         __m128i data = _mm_loadu_si128((__m128i*)&src[i*2]);
         _mm_storeu_si128((__m128i*)&dst[i*2], data);
     }
     
-    // Handle remainder
     if (count % 2) {
         dst[count-1] = src[count-1];
     }
 #elif defined(__ARM_NEON) || defined(__ARM_NEON__)
-    // NEON version - 16 bytes at a time (2 Terms)
     for (size_t i = 0; i < count / 2; i++) {
         uint64x2_t data = vld1q_u64((const uint64_t*)&src[i*2]);
         vst1q_u64((uint64_t*)&dst[i*2], data);
     }
     
-    // Handle remainder
     if (count % 2) {
         dst[count-1] = src[count-1];
     }
 #else
-    // Fallback for non-SIMD architectures
     memcpy(dst, src, count * sizeof(Term));
 #endif
 }
@@ -421,23 +414,21 @@ Term expand_ref(Loc def_idx) {
   Term root = term_offset_loc(nodes[0], offset);
 
 #if HVM_HAS_SIMD && defined(__SSE2__)
-  // Optimize for SIMD if available and nodes have significant size
   if (nodes_len > 16) {
     u32 i = 1;
     
-    // Process 8 terms at a time using SIMD
+    // Process 8 terms at a time, compiler will unroll and use SIMD
     for (; i + 7 < nodes_len; i += 8) {
       for (int j = 0; j < 8; j++) {
         set(i + offset + j, term_offset_loc(nodes[i + j], offset));
       }
     }
     
-    // Process remaining terms
     for (; i < nodes_len; i++) {
       set(i + offset, term_offset_loc(nodes[i], offset));
     }
   } else {
-    // For small node lists, use the original approach
+    // For small node lists, use the og approach
     u32 i = 1;
     for (; i < nodes_len; i++) {
       set(i + offset, term_offset_loc(nodes[i], offset));
@@ -457,7 +448,6 @@ Term expand_ref(Loc def_idx) {
     set(i + offset + 7, term_offset_loc(nodes[i + 7], offset));
   }
 
-  // Remaining nodes
   for (; i < nodes_len; i++) {
     set(i + offset, term_offset_loc(nodes[i], offset));
   }

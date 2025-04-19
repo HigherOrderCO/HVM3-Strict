@@ -1123,8 +1123,16 @@ static inline int steal_work(int thief_id, Term* neg, Term* pos) {
 void* worker_thread(void* arg) {
     int worker_id = *(int*)arg;
     free(arg);
-    
-   
+//
+// #ifndef _WIN32
+//     if (worker_id > 0) {  // Skip main thread
+//         cpu_set_t cpuset;
+//         CPU_ZERO(&cpuset);
+//         CPU_SET(worker_id % get_num_threads(), &cpuset);
+//         pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+//     }
+// #endif
+//
     Term neg, pos;
     int work_found = 0;
     int consecutive_idle = 0;

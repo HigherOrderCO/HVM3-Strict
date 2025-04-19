@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdbool.h>
 
 #define DEBUG_LOG(fmt, ...) printf("[DEBUG] " fmt "\n", ##__VA_ARGS__)
 
@@ -383,16 +384,30 @@ Term expand_ref(Loc def_idx) {
 // Atomic Linker
 static inline void move(Loc neg_loc, u64 pos);
 
-static inline void link_terms(Term neg, Term pos) {
-  if (term_tag(pos) == VAR) {
-    Term far = swap(term_loc(pos), neg);
-    if (term_tag(far) != SUB) {
-      move(term_loc(pos), far);
+static inline void local_push(int worker_id, Term neg, Term pos);
+
+__thread int current_worker_id = -1;
+
+static inline void schedule_interaction(Term neg, Term pos) {
+    if (current_worker_id >= 0) {
+        local_push(current_worker_id, neg, pos);
+    } else {
+        // Fallback to global queue if not in a worker thread
+        rbag_push(neg, pos);
     }
-  } else {
-    rbag_push(neg, pos);
-  }
 }
+
+static inline void link_terms(Term neg, Term pos) {
+    if (term_tag(pos) == VAR) {
+        Term far = swap(term_loc(pos), neg);
+        if (term_tag(far) != SUB) {
+            move(term_loc(pos), far);
+        }
+    } else {
+        schedule_interaction(neg, pos);
+    }
+}
+
 
 static inline void move(Loc neg_loc, Term pos) {
   Term neg = swap(neg_loc, pos);
@@ -975,7 +990,247 @@ static void interact(Term neg, Term pos) {
   }
 }
 
+typedef struct {
+    thread_t thread;
+    Loc queue_start;
+    Loc queue_end;
+    atomic_bool active;
+    // Lock for queue access during stealing
+    atomic_flag queue_lock;
+} Worker;
 
+static Worker* workers = NULL;
+static int num_workers = 0;
+
+#define QUEUE_SIZE (1 << 16)
+#define QUEUE_MASK (QUEUE_SIZE - 1)
+
+// Initialize per-worker queues
+void init_workers() {
+    num_workers = MAX_THREADS;
+    workers = calloc(num_workers, sizeof(Worker));
+    
+    for (int i = 0; i < num_workers; i++) {
+        workers[i].queue_start = 0;
+        workers[i].queue_end = 0;
+        atomic_store(&workers[i].active, true);
+        atomic_flag_clear(&workers[i].queue_lock);
+    }
+}
+
+// Push to the current worker's queue
+static inline void local_push(int worker_id, Term neg, Term pos) {
+    Worker* worker = &workers[worker_id];
+    Loc start = worker->queue_start;
+    Loc end = worker->queue_end;
+    
+    // Check if queue is full
+    if ((end - start) >= QUEUE_SIZE) {
+        // Queue is full, push to global queue as fallback
+        rbag_push(neg, pos);
+        return;
+    }
+    
+    // Get location in circular buffer
+    Loc loc = RBAG + (end & QUEUE_MASK) * 2;
+    
+    // Store the terms
+    set(loc, neg);
+    set(loc + 1, pos);
+    
+    // Update end pointer (atomic to ensure visibility to stealers)
+    atomic_thread_fence(memory_order_release);
+    worker->queue_end = end + 1;
+}
+
+// Pop from current worker's queue
+static inline int local_pop(int worker_id, Term* neg, Term* pos) {
+    Worker* worker = &workers[worker_id];
+    Loc end = worker->queue_end;
+    Loc start = worker->queue_start;
+    
+    if (start >= end) {
+        return 0; // Empty queue
+    }
+    
+    // First try to acquire the lock to prevent concurrent stealing
+    if (!atomic_flag_test_and_set(&worker->queue_lock)) {
+        // Got the lock
+        end = worker->queue_end; // Re-check after lock
+        if (start < end) {
+            // Get location in circular buffer
+            Loc loc = RBAG + ((end - 1) & QUEUE_MASK) * 2;
+            
+            // Take the terms
+            *neg = take(loc);
+            *pos = take(loc + 1);
+            
+            // Update end pointer
+            worker->queue_end = end - 1;
+            atomic_flag_clear(&worker->queue_lock);
+            return 1;
+        }
+        atomic_flag_clear(&worker->queue_lock);
+    }
+    
+    return 0; // Failed to pop
+}
+
+// Try to steal work from another worker
+static inline int steal_work(int thief_id, Term* neg, Term* pos) {
+    // Try each worker in round-robin fashion
+    for (int attempt = 0; attempt < num_workers - 1; attempt++) {
+        int victim_id = (thief_id + attempt + 1) % num_workers;
+        Worker* victim = &workers[victim_id];
+        
+        // Check if victim has work
+        Loc victim_start = victim->queue_start;
+        Loc victim_end = victim->queue_end;
+        
+        if (victim_start >= victim_end) {
+            continue; // Empty queue, try next worker
+        }
+        
+        // Try to acquire the lock
+        if (!atomic_flag_test_and_set(&victim->queue_lock)) {
+            // Re-check after acquiring lock
+            victim_start = victim->queue_start;
+            victim_end = victim->queue_end;
+            
+            if (victim_start < victim_end) {
+                // Get location in circular buffer (steal from front)
+                Loc loc = RBAG + (victim_start & QUEUE_MASK) * 2;
+                
+                // Take the terms
+                *neg = take(loc);
+                *pos = take(loc + 1);
+                
+                // Update start pointer
+                victim->queue_start = victim_start + 1;
+                atomic_flag_clear(&victim->queue_lock);
+                return 1;
+            }
+            
+            atomic_flag_clear(&victim->queue_lock);
+        }
+    }
+    
+    // No work could be stolen
+    return 0;
+}
+
+// Thread entry point
+void* worker_thread(void* arg) {
+    int worker_id = *(int*)arg;
+    free(arg);
+//
+// #ifndef _WIN32
+//     if (worker_id > 0) {  // Skip main thread
+//         cpu_set_t cpuset;
+//         CPU_ZERO(&cpuset);
+//         CPU_SET(worker_id % get_num_threads(), &cpuset);
+//         pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+//     }
+// #endif
+//
+    Term neg, pos;
+    int work_found = 0;
+    int consecutive_idle = 0;
+    
+    while (atomic_load(&workers[worker_id].active)) {
+        // Try to get work from our own queue
+        if (local_pop(worker_id, &neg, &pos)) {
+            interact(neg, pos);
+            work_found = 1;
+            consecutive_idle = 0;
+            continue;
+        }
+        
+        // Try to steal work
+        if (steal_work(worker_id, &neg, &pos)) {
+            interact(neg, pos);
+            work_found = 1;
+            consecutive_idle = 0;
+            continue;
+        }
+        
+        // Try global queue as fallback
+        Loc loc = rbag_pop();
+        if (loc != 0) {
+            neg = take(loc);
+            pos = take(loc + 1);
+            interact(neg, pos);
+            work_found = 1;
+            consecutive_idle = 0;
+            continue;
+        }
+        
+        // No work found, increment idle counter
+        consecutive_idle++;
+        
+        // If we've been idle for too long, check if we should terminate
+        if (consecutive_idle > 1000) {
+            // Check if all queues are empty
+            int all_empty = 1;
+            for (int i = 0; i < num_workers; i++) {
+                if (workers[i].queue_start < workers[i].queue_end) {
+                    all_empty = 0;
+                    break;
+                }
+            }
+            
+            // Also check global queue
+            if (rbag_ini() < rbag_end()) {
+                all_empty = 0;
+            }
+            
+            if (all_empty) {
+                // Signal termination if we're the last worker with no work
+                for (int i = 0; i < num_workers; i++) {
+                    atomic_store(&workers[i].active, false);
+                }
+                break;
+            }
+            
+            // Reset idle counter and try again
+            consecutive_idle = 0;
+            
+            // Small backoff to reduce contention
+            for (volatile int i = 0; i < 100; i++);
+        }
+    }
+    
+    return NULL;
+}
+
+void start_workers() {
+    init_workers();
+    
+    for (int i = 0; i < num_workers; i++) {
+        int* id = malloc(sizeof(int));
+        *id = i;
+        current_worker_id = i; // Set for the main thread
+        
+        if (i == 0) {
+            // Use current thread as worker 0
+            worker_thread(id);
+        } else {
+            thread_create(&workers[i].thread, NULL, worker_thread, id);
+        }
+    }
+}
+
+void join_workers() {
+    // Join all worker threads except the main thread
+    for (int i = 1; i < num_workers; i++) {
+        thread_join(workers[i].thread, NULL);
+    }
+    
+    free(workers);
+    workers = NULL;
+}
+
+// Old implementation, left for reference
 static inline int thread_work() {
     Loc loc = rbag_pop();
    
@@ -1023,18 +1278,22 @@ void boot(Loc def_idx) {
 }
 
 Term normalize(Term term) {
-  if (term_tag(term) != REF) {
-    printf("normalizing non-ref\n");
-    exit(1);
-  }
+    if (term_tag(term) != REF) {
+        printf("normalizing non-ref\n");
+        exit(1);
+    }
 
-  boot(term_loc(term));
+    boot(term_loc(term));
+    
+    // Start worker threads
+    start_workers();
+    
+    // Workers run until all work is complete
+    
+    // Join worker threads
+    join_workers();
 
-  while (thread_work());  
-  
-  /*printf("MAX_THREADS: %u\n", MAX_THREADS);*/
-  
-  return get(0);
+    return get(0);
 }
 
 // Debugging
@@ -1078,6 +1337,7 @@ static char *tag_to_str(Tag tag) {
   }
 }
 
+// FILE VERSION: (or you can >> the stdio into a file)
 /*void dump_buff() {*/
 /*  FILE *file = fopen("multi.txt", "w");*/
 /*  if (file == NULL) {*/
@@ -1117,7 +1377,7 @@ static char *tag_to_str(Tag tag) {
 /**/
 /*  fclose(file);*/
 /*}*/
-
+// STD VERSION
 void dump_buff() {
   printf("------------------\n");
   printf("      NODES\n");
